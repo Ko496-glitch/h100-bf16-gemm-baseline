@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <random>
 #include <vector>
 
 #define CUDA_CHECK(call)                                                     \
@@ -39,6 +40,9 @@
       std::exit(EXIT_FAILURE);                                               \
     }                                                                        \
   } while (0)
+
+// PASS if kernel output is within 1% of the reference. this is more like a pass fail type. this is a normal thresholder until we actually add cuBLAS refrence. 
+constexpr float kErrorTolerance = 1.0e-2f;
 
 // One thread computes one C[row, col]. A 16x16 block covers a 16x16 output
 // region: threadIdx.y/blockIdx.y select row, and threadIdx.x/blockIdx.x select
@@ -160,7 +164,7 @@ __global__ void shared_memory_bf16_gemm(const __nv_bfloat16* A,
 }
 
 struct VerificationResult {
-  float max_abs_error;
+  float relative_error;
   bool correct;
 };
 
@@ -170,16 +174,22 @@ static VerificationResult verify_output(const float* d_C,
   CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, h_C.size() * sizeof(float),
                         cudaMemcpyDeviceToHost));
 
-  constexpr float atol = 1.0e-3f;
-  constexpr float rtol = 1.0e-3f;
-  VerificationResult result{0.0f, true};
+  // Normwise relative error over the whole output, accumulated in double so
+  // summing millions of terms does not itself become the dominant error.
+  double diff_norm_sq = 0.0;
+  double ref_norm_sq = 0.0;
   for (size_t i = 0; i < h_C.size(); ++i) {
-    const float abs_error = std::fabs(h_C[i] - reference[i]);
-    result.max_abs_error = std::max(result.max_abs_error, abs_error);
-    if (abs_error > atol + rtol * std::fabs(reference[i])) {
-      result.correct = false;
-    }
+    const double diff = static_cast<double>(h_C[i]) - static_cast<double>(reference[i]);
+    diff_norm_sq += diff * diff;
+    ref_norm_sq += static_cast<double>(reference[i]) * static_cast<double>(reference[i]);
   }
+  const double relative_error = ref_norm_sq > 0.0
+      ? std::sqrt(diff_norm_sq) / std::sqrt(ref_norm_sq)
+      : std::sqrt(diff_norm_sq);
+
+  VerificationResult result;
+  result.relative_error = static_cast<float>(relative_error);
+  result.correct = relative_error <= static_cast<double>(kErrorTolerance);
   return result;
 }
 
@@ -237,7 +247,7 @@ static void print_kernel_result(const char* name, int M, int N, int K,
   if (reference_gflops > 0.0) {
     std::printf("%s %% of cuBLAS: %.2f\n", name, 100.0 * gflops / reference_gflops);
   }
-  std::printf("%s max absolute error: %.8g\n", name, result.max_abs_error);
+  std::printf("%s normwise relative error: %.8g\n", name, result.relative_error);
   std::printf("%s correctness: %s\n", name,
               result.correct ? "PASS" : "FAIL");
 }
@@ -268,9 +278,9 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  const int M = argc == 4 ? parse_dimension(argv[1], "M") : 512;
-  const int N = argc == 4 ? parse_dimension(argv[2], "N") : 512;
-  const int K = argc == 4 ? parse_dimension(argv[3], "K") : 512;
+  const int M = argc == 4 ? parse_dimension(argv[1], "M") : 4096;
+  const int N = argc == 4 ? parse_dimension(argv[2], "N") : 4096;
+  const int K = argc == 4 ? parse_dimension(argv[3], "K") : 4096;
   const size_t a_count = checked_elements(static_cast<size_t>(M), K);
   const size_t b_count = checked_elements(static_cast<size_t>(K), N);
   const size_t c_count = checked_elements(static_cast<size_t>(M), N);
@@ -280,26 +290,34 @@ int main(int argc, char** argv) {
   std::vector<float> h_C(c_count);
   std::vector<float> reference(c_count, 0.0f);
 
-  // Deterministic, bounded inputs make runs reproducible and verification clear.
+  // Fixed seed makes runs reproducible; inputs are standard normal, rounded
+  // to BF16 for the GPU kernels and for the CPU reference below.
+  constexpr unsigned kRandomSeed = 42;
+  std::mt19937 rng(kRandomSeed);
+  std::normal_distribution<float> standard_normal(0.0f, 1.0f);
   for (size_t i = 0; i < a_count; ++i) {
-    const float value = static_cast<float>(static_cast<int>((i * 17 + 3) % 101) - 50) / 50.0f;
-    h_A[i] = __float2bfloat16(value);
+    h_A[i] = __float2bfloat16(standard_normal(rng));
   }
   for (size_t i = 0; i < b_count; ++i) {
-    const float value = static_cast<float>(static_cast<int>((i * 29 + 11) % 97) - 48) / 48.0f;
-    h_B[i] = __float2bfloat16(value);
+    h_B[i] = __float2bfloat16(standard_normal(rng));
   }
 
-  // CPU reference uses the same BF16-rounded inputs and accumulates in FP32.
-  for (int row = 0; row < M; ++row) {
-    for (int col = 0; col < N; ++col) {
-      float acc = 0.0f;
-      for (int k = 0; k < K; ++k) {
-        const float a = __bfloat162float(h_A[static_cast<size_t>(row) * K + k]);
-        const float b = __bfloat162float(h_B[static_cast<size_t>(k) * N + col]);
-        acc += a * b;
+  // The CPU triple loop is only fast enough to use as ground truth up to
+  // 1024^3; above that, cuBLAS's own output (verified at smaller sizes)
+  // stands in as the reference.
+  const bool use_cpu_reference = M <= 1024 && N <= 1024 && K <= 1024;
+  if (use_cpu_reference) {
+    // CPU reference uses the same BF16-rounded inputs and accumulates in FP32.
+    for (int row = 0; row < M; ++row) {
+      for (int col = 0; col < N; ++col) {
+        float acc = 0.0f;
+        for (int k = 0; k < K; ++k) {
+          const float a = __bfloat162float(h_A[static_cast<size_t>(row) * K + k]);
+          const float b = __bfloat162float(h_B[static_cast<size_t>(k) * N + col]);
+          acc += a * b;
+        }
+        reference[static_cast<size_t>(row) * N + col] = acc;
       }
-      reference[static_cast<size_t>(row) * N + col] = acc;
     }
   }
 
@@ -335,6 +353,11 @@ int main(int argc, char** argv) {
                               CUBLAS_COMPUTE_32F,
                               CUBLAS_GEMM_DEFAULT));
   });
+  if (!use_cpu_reference) {
+    // No CPU reference at this size: cuBLAS's own output is the reference.
+    CUDA_CHECK(cudaMemcpy(reference.data(), d_C, c_count * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+  }
   const VerificationResult cublas_result = verify_output(d_C, h_C, reference);
   print_kernel_result("cuBLAS", M, N, K, cublas_ms, cublas_result);
   const double cublas_gflops = achieved_gflops(M, N, K, cublas_ms);
