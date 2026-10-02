@@ -7,6 +7,7 @@
 // This intentionally simple kernel is a performance baseline for later
 // shared-memory, TMA, WGMMA, and pipelining experiments.
 
+#include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -24,6 +25,16 @@
     if (error__ != cudaSuccess) {                                            \
       std::fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,\
                    cudaGetErrorString(error__));                             \
+      std::exit(EXIT_FAILURE);                                               \
+    }                                                                        \
+  } while (0)
+
+#define CUBLAS_CHECK(call)                                                   \
+  do {                                                                       \
+    const cublasStatus_t status__ = (call);                                  \
+    if (status__ != CUBLAS_STATUS_SUCCESS) {                                 \
+      std::fprintf(stderr, "cuBLAS error at %s:%d: status %d\n", __FILE__,   \
+                   __LINE__, static_cast<int>(status__));                    \
       std::exit(EXIT_FAILURE);                                               \
     }                                                                        \
   } while (0)
@@ -212,13 +223,19 @@ static double achieved_gflops(int M, int N, int K, float elapsed_ms) {
              : 0.0;
 }
 
+// reference_gflops is the cuBLAS kernel's achieved GFLOP/s; pass 0.0 to skip
+// the "% of cuBLAS" line (used for the cuBLAS kernel's own result).
 static void print_kernel_result(const char* name, int M, int N, int K,
                                 float elapsed_ms,
-                                const VerificationResult& result) {
+                                const VerificationResult& result,
+                                double reference_gflops = 0.0) {
+  const double gflops = achieved_gflops(M, N, K, elapsed_ms);
   std::printf("%s dimensions: M=%d N=%d K=%d\n", name, M, N, K);
   std::printf("%s runtime: %.6f ms\n", name, elapsed_ms);
-  std::printf("%s achieved GFLOP/s: %.3f\n",
-              name, achieved_gflops(M, N, K, elapsed_ms));
+  std::printf("%s achieved GFLOP/s: %.3f\n", name, gflops);
+  if (reference_gflops > 0.0) {
+    std::printf("%s %% of cuBLAS: %.2f\n", name, 100.0 * gflops / reference_gflops);
+  }
   std::printf("%s max absolute error: %.8g\n", name, result.max_abs_error);
   std::printf("%s correctness: %s\n", name,
               result.correct ? "PASS" : "FAIL");
@@ -296,6 +313,31 @@ int main(int argc, char** argv) {
 
   std::printf("Timing: median of 5 samples, 10 launches per sample; one warm-up launch per kernel\n");
 
+  cublasHandle_t cublas_handle;
+  CUBLAS_CHECK(cublasCreate(&cublas_handle));
+
+  // cuBLAS is column-major; A, B, C here are row-major. A row-major (r x c)
+  // matrix is exactly the same bytes as its transpose read column-major, so
+  // instead of transposing anything we compute C^T = B^T * A^T by swapping
+  // the A/B arguments and swapping M/N: the N x M column-major result cuBLAS
+  // writes is precisely our M x N row-major C.
+  const float cublas_alpha = 1.0f;
+  const float cublas_beta = 0.0f;
+  const float cublas_ms = benchmark_kernel_ms([&]() {
+    CUBLAS_CHECK(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                              N, M, K,
+                              &cublas_alpha,
+                              d_B, CUDA_R_16BF, N,
+                              d_A, CUDA_R_16BF, K,
+                              &cublas_beta,
+                              d_C, CUDA_R_32F, N,
+                              CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT));
+  });
+  const VerificationResult cublas_result = verify_output(d_C, h_C, reference);
+  print_kernel_result("cuBLAS", M, N, K, cublas_ms, cublas_result);
+  const double cublas_gflops = achieved_gflops(M, N, K, cublas_ms);
+
   const dim3 naive_block(16, 16);
   const dim3 naive_grid((N - 1) / naive_block.x + 1,
                         (M - 1) / naive_block.y + 1);
@@ -303,7 +345,7 @@ int main(int argc, char** argv) {
     naive_bf16_gemm<<<naive_grid, naive_block>>>(d_A, d_B, d_C, M, N, K);
   });
   const VerificationResult naive_result = verify_output(d_C, h_C, reference);
-  print_kernel_result("Naive", M, N, K, naive_ms, naive_result);
+  print_kernel_result("Naive", M, N, K, naive_ms, naive_result, cublas_gflops);
 
   const dim3 tiled_block(TILE_N / 2, TILE_M / 2);
   const dim3 tiled_grid((N - 1) / TILE_N + 1,
@@ -321,13 +363,14 @@ int main(int argc, char** argv) {
         <<<tiled_grid, tiled_block, tiled_smem_bytes>>>(d_A, d_B, d_C, M, N, K);
   });
   const VerificationResult tiled_result = verify_output(d_C, h_C, reference);
-  print_kernel_result("Shared-memory tiled", M, N, K, tiled_ms, tiled_result);
+  print_kernel_result("Shared-memory tiled", M, N, K, tiled_ms, tiled_result, cublas_gflops);
 
+  CUBLAS_CHECK(cublasDestroy(cublas_handle));
   CUDA_CHECK(cudaFree(d_A));
   CUDA_CHECK(cudaFree(d_B));
   CUDA_CHECK(cudaFree(d_C));
 
-  return naive_result.correct && tiled_result.correct
+  return cublas_result.correct && naive_result.correct && tiled_result.correct
              ? EXIT_SUCCESS
              : EXIT_FAILURE;
 }
