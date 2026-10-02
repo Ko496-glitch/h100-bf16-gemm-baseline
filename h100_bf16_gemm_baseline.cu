@@ -1,7 +1,8 @@
 // Naive BF16-input, FP32-accumulation GEMM baseline for NVIDIA Hopper.
 //
-// Build (requires a CUDA toolkit with sm_90 support):
-//   nvcc -O3 -std=c++17 -arch=sm_90 h100_bf16_gemm_baseline.cu -o gemm_baseline
+// Build (requires a CUDA toolkit with sm_90a support and cuBLAS): `make`
+//   (equivalent to: nvcc -O3 -std=c++17 -arch=sm_90a -lineinfo
+//    h100_bf16_gemm_baseline.cu -o gemm_baseline -lcublas -lcuda)
 // Run: ./gemm_baseline [M N K]
 //
 // This intentionally simple kernel is a performance baseline for later

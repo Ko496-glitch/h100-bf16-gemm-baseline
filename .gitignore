@@ -1,0 +1,3 @@
+gemm_baseline
+*.ncu-rep
+*.nsys-rep
