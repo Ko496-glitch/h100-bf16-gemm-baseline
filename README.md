@@ -7,11 +7,13 @@ This single-file CUDA project compares two row-major GEMM implementations for BF
 
 ## Build
 
-On a machine with the CUDA Toolkit and an NVIDIA Hopper GPU:
+On a machine with the CUDA Toolkit, cuBLAS, and an NVIDIA Hopper GPU:
 
 ```bash
-nvcc -O3 -std=c++17 -arch=sm_90 h100_bf16_gemm_baseline.cu -o gemm_baseline
+make
 ```
+
+This builds with `nvcc -O3 -std=c++17 -arch=sm_90a -lineinfo`, linking `-lcublas -lcuda`. Use `make run` to build (if needed) and run with default dimensions, and `make clean` to remove the binary.
 
 ## Run
 
