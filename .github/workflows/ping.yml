@@ -1,0 +1,31 @@
+name: Ping PR Author
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  ping:
+    if: >
+      github.event.issue.pull_request &&
+      github.event.comment.body == 'ping'
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ping PR author
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_AUTHOR=$(gh pr view ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --json author \
+            --jq '.author.login')
+
+          gh pr comment ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --body "@$PR_AUTHOR ping!"
