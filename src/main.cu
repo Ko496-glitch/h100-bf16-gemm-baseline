@@ -2,11 +2,9 @@
 //
 // Build (requires a CUDA toolkit with sm_90a support and cuBLAS): `make`
 //   (equivalent to: nvcc -O3 -std=c++17 -arch=sm_90a -lineinfo
-//    h100_bf16_gemm_baseline.cu -o gemm_baseline -lcublas -lcuda)
+//    -I src -I benchmarks -I tests src/main.cu -o gemm_baseline
+//    -lcublas -lcuda)
 // Run: ./gemm_baseline [M N K]
-//
-// This intentionally simple kernel is a performance baseline for later
-// shared-memory, TMA, WGMMA, and pipelining experiments.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -18,6 +16,7 @@
 #include <vector>
 
 #include "common/utils.cuh"
+#include "correctness.cuh"
 #include "harness.cuh"
 #include "kernels/00_cublas.cuh"
 #include "kernels/01_naive.cuh"

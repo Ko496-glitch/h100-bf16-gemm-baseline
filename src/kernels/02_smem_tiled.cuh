@@ -97,8 +97,7 @@ __global__ void shared_memory_bf16_gemm(const __nv_bfloat16* A,
     C[row1 * static_cast<size_t>(N) + col1] = acc11;
 }
 
-// One BF16 A tile plus one BF16 B tile. Future multi-stage pipelines will
-// multiply this by their stage count; large allocations can reduce occupancy.
+// One BF16 A tile plus one BF16 B tile; large allocations can reduce occupancy.
 // H100 has up to 228 KiB shared memory per SM and 227 KiB addressable per
 // block; that is a hardware ceiling, not a target. Allocations above 48 KiB
 // per block need an explicit opt-in. This initial pair of tiles uses only 4 KiB.
