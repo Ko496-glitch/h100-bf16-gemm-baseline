@@ -1,3 +1,4 @@
 gemm_baseline
 *.ncu-rep
 *.nsys-rep
+test_tma
